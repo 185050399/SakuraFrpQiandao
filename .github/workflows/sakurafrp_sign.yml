@@ -7,20 +7,118 @@ on:
   
   # 允许手动触发
   workflow_dispatch:
+
+concurrency:
+  group: sakurafrp-checkin
+  cancel-in-progress: false
   
 jobs:
   checkin:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
     
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       
       - name: 设置 Python 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
+
+      - name: 验证必需配置
+        env:
+          SAKURAFRP_USER: ${{ secrets.SAKURAFRP_USER }}
+          SAKURAFRP_PASS: ${{ secrets.SAKURAFRP_PASS }}
+          BASE_URL: ${{ secrets.BASE_URL }}
+          API_KEY: ${{ secrets.API_KEY }}
+          MODEL: ${{ secrets.MODEL }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_AUDIENCE: ${{ secrets.TS_AUDIENCE }}
+          API_CONNECT_IP: ${{ secrets.API_CONNECT_IP }}
+        run: |
+          python - <<'PY'
+          import os
+
+          required = (
+              "SAKURAFRP_USER", "SAKURAFRP_PASS", "BASE_URL", "API_KEY", "MODEL",
+              "TS_OAUTH_CLIENT_ID", "TS_AUDIENCE", "API_CONNECT_IP",
+          )
+          missing = [name for name in required if not os.environ.get(name, "").strip()]
+          if missing:
+              raise SystemExit("缺少 GitHub Secrets: " + ", ".join(missing))
+          print("必需配置已齐全")
+          PY
+
+      - name: 通过 OIDC 接入 Tailscale 临时节点
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:sakurafrp-ci
+          hostname: sakurafrp-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          args: --accept-routes --accept-dns=false
+
+      - name: 验证私网路由、HTTPS 与模型配置
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          API_KEY: ${{ secrets.API_KEY }}
+          MODEL: ${{ secrets.MODEL }}
+          API_CONNECT_IP: ${{ secrets.API_CONNECT_IP }}
+        run: |
+          python - <<'PY'
+          import ipaddress
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+          from urllib.parse import urlsplit
+
+          base_url = os.environ["BASE_URL"].strip().rstrip("/")
+          parsed = urlsplit(base_url)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+              raise SystemExit("BASE_URL 必须是无内嵌凭据的 HTTPS 地址")
+          if not re.fullmatch(r"[a-zA-Z0-9.-]+", parsed.hostname):
+              raise SystemExit("API 主机名无效")
+
+          private_ip = ipaddress.ip_address(os.environ["API_CONNECT_IP"].strip())
+          private_ranges = [ipaddress.ip_network(cidr) for cidr in (
+              "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+          )]
+          if not any(private_ip in network for network in private_ranges):
+              raise SystemExit("API_CONNECT_IP 必须是私网或 Tailscale IPv4 地址")
+          route = subprocess.check_output(["ip", "route", "get", str(private_ip)], text=True)
+          if "tailscale0" not in route:
+              raise SystemExit("目标 API 未使用 Tailscale 私网路由，终止运行")
+
+          # 仅修改本次临时 runner 的 hosts；不改路由器 DNS、监听地址或公网端口。
+          subprocess.run(
+              ["sudo", "tee", "-a", "/etc/hosts"],
+              input=f"{private_ip} {parsed.hostname}\n", text=True,
+              stdout=subprocess.DEVNULL, check=True,
+          )
+          request = urllib.request.Request(
+              base_url + "/models",
+              headers={"Authorization": "Bearer " + os.environ["API_KEY"]},
+          )
+          try:
+              # 使用系统 CA 正常验证 HTTPS，不允许关闭证书校验。
+              with urllib.request.urlopen(request, timeout=25) as response:
+                  data = json.load(response)
+          except Exception as error:
+              raise SystemExit("私网模型 API 预检失败: " + type(error).__name__) from None
+          if not any(item.get("id") == os.environ["MODEL"] for item in data.get("data", [])):
+              raise SystemExit("API 可访问，但 MODEL 不在模型列表中")
+          print("已确认 Tailscale 私网路由、HTTPS 与所选模型均可用")
+          PY
       
       - name: 安装 Python 依赖
         run: |
@@ -35,7 +133,8 @@ jobs:
           BASE_URL: ${{ secrets.BASE_URL }}
           API_KEY: ${{ secrets.API_KEY }}
           MODEL: ${{ secrets.MODEL }}
-          IMAGE_AS_BASE64: ${{ secrets.IMAGE_AS_BASE64 || 'false' }}
+          IMAGE_AS_BASE64: ${{ secrets.IMAGE_AS_BASE64 || 'true' }}
+          PYTHONUNBUFFERED: '1'
           CI: 'true'
           HEADLESS: 'true'
         run: |
@@ -70,4 +169,5 @@ jobs:
         with:
           name: checkin-logs
           path: checkin.log
+          if-no-files-found: ignore
           retention-days: 7
