@@ -40,6 +40,18 @@ jobs:
           HEADLESS: 'true'
         run: |
           python main.py
+          # 上游脚本会吞掉异常；必须检查实际完成标记，不能仅依赖退出码。
+          python - <<'PY'
+          from pathlib import Path
+
+          log_file = Path("checkin.log")
+          if not log_file.is_file():
+              raise SystemExit("签到失败：未生成 checkin.log")
+          log_text = log_file.read_text(encoding="utf-8")
+          if "✓ 签到流程完成" not in log_text:
+              raise SystemExit("签到失败：日志中没有签到完成标记，请检查前面的错误")
+          print("已确认签到流程完成")
+          PY
       
       - name: 发送邮件通知
         if: always()
