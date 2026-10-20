@@ -64,7 +64,8 @@ jobs:
           audience: ${{ secrets.TS_AUDIENCE }}
           tags: tag:sakurafrp-ci
           hostname: sakurafrp-ci-${{ github.run_id }}-${{ github.run_attempt }}
-          args: --accept-routes --accept-dns=false
+          # 此 Action 已内置 --accept-routes，不可重复传入。
+          args: --accept-dns=false
 
       - name: 验证私网路由、HTTPS 与模型配置
         env:
